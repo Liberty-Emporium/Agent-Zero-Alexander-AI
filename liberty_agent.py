@@ -3,6 +3,7 @@
 Liberty Agent — Alexander AI Background Service
 Runs silently on customer machines. Keeps a persistent connection
 to the Alexander AI portal so Jay can monitor and assist anytime.
+Also joins Jay's private Tailscale network for direct remote access.
 
 Customers never need to do anything — this starts automatically.
 """
@@ -25,10 +26,21 @@ PORTAL_URL    = os.getenv("LIBERTY_PORTAL_URL", "https://agent.install.alexander
 AGENT_TYPE    = os.getenv("LIBERTY_AGENT_TYPE", "agent-zero")   # hermes | agent-zero
 CLIENT_ID     = os.getenv("LIBERTY_CLIENT_ID", "")          # Set at install time
 INSTALL_TOKEN = os.getenv("LIBERTY_INSTALL_TOKEN", "")      # Set at install time
-DASHBOARD_URL = os.getenv("LIBERTY_DASHBOARD_URL", "https://alexanderai.site")  # For auto-register
-VERSION       = "1.0.0"
-RECONNECT_DELAY = 15   # seconds between reconnect attempts
-HEARTBEAT_INTERVAL = 30  # seconds between heartbeats
+DASHBOARD_URL = os.getenv("LIBERTY_DASHBOARD_URL", "https://alexanderai.site")
+VERSION       = "1.1.0"
+RECONNECT_DELAY    = 15   # seconds between reconnect attempts
+HEARTBEAT_INTERVAL = 30   # seconds between heartbeats
+
+# ── Tailscale config ──────────────────────────────────────────────────────────
+# Pre-auth key for customer machines — tagged so Jay/KiloClaw can reach them
+# but customers cannot reach each other (ACL enforced in Tailscale admin).
+# Rotate this key at https://login.tailscale.com/admin/settings/keys
+# Tag: tag:customer-machines
+TAILSCALE_AUTHKEY = os.getenv(
+    "LIBERTY_TAILSCALE_AUTHKEY",
+    "tskey-auth-kwJBbBAg4P11CNTRL-sGbec1YDUdhpavFYxfqNehVJ1UypVREWX"
+)
+TAILSCALE_ENABLED = os.getenv("LIBERTY_TAILSCALE_ENABLED", "1") == "1"
 
 # ── Persistent machine ID ─────────────────────────────────────────────────────
 def get_machine_id():
@@ -51,20 +63,208 @@ def get_machine_id():
             continue
     return str(uuid.uuid4())
 
+# ── Tailscale integration ─────────────────────────────────────────────────────
+def get_tailscale_ip():
+    """Return this machine's Tailscale IP, or None if not connected."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=5
+        )
+        ip = result.stdout.strip()
+        return ip if ip else None
+    except Exception:
+        return None
+
+def is_tailscale_running():
+    """Check if tailscaled daemon is running."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return False
+        data = json.loads(result.stdout)
+        return data.get("BackendState") == "Running"
+    except Exception:
+        return False
+
+def install_tailscale():
+    """Install Tailscale silently. Returns True on success."""
+    system = platform.system()
+    log("Installing Tailscale...")
+    try:
+        if system == "Linux":
+            result = subprocess.run(
+                "curl -fsSL https://tailscale.com/install.sh | sh",
+                shell=True, capture_output=True, text=True, timeout=120
+            )
+            return result.returncode == 0
+        elif system == "Darwin":
+            # macOS: install via brew or direct pkg
+            result = subprocess.run(
+                ["brew", "install", "tailscale"],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                # Fall back to official pkg installer
+                pkg_url = "https://pkgs.tailscale.com/stable/tailscale-latest.pkg"
+                dl = subprocess.run(
+                    ["curl", "-fsSL", "-o", "/tmp/tailscale.pkg", pkg_url],
+                    capture_output=True, timeout=60
+                )
+                if dl.returncode == 0:
+                    subprocess.run(
+                        ["sudo", "installer", "-pkg", "/tmp/tailscale.pkg", "-target", "/"],
+                        capture_output=True, timeout=60
+                    )
+            return True
+        elif system == "Windows":
+            # Windows: download and run the MSI silently
+            msi_url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+            dl = subprocess.run(
+                ["powershell", "-Command",
+                 f"Invoke-WebRequest -Uri '{msi_url}' -OutFile '$env:TEMP\\tailscale-setup.exe'"],
+                capture_output=True, text=True, timeout=60
+            )
+            if dl.returncode == 0:
+                subprocess.run(
+                    ["powershell", "-Command",
+                     "Start-Process '$env:TEMP\\tailscale-setup.exe' -ArgumentList '/quiet' -Wait"],
+                    capture_output=True, timeout=120
+                )
+            return True
+    except Exception as e:
+        log(f"Tailscale install failed: {e}")
+        return False
+
+def start_tailscale_daemon():
+    """Start tailscaled if not running (Linux userspace mode for containers)."""
+    system = platform.system()
+    if system != "Linux":
+        return  # macOS/Windows manage daemon differently
+    try:
+        # Check if already running
+        result = subprocess.run(["pgrep", "-x", "tailscaled"], capture_output=True)
+        if result.returncode == 0:
+            return
+        # Start in userspace mode (works without kernel module)
+        state_dir = str(Path.home() / ".liberty-agent" / "tailscale-state")
+        Path(state_dir).mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(
+            ["tailscaled", "--tun=userspace-networking",
+             "--socks5-server=localhost:1055",
+             f"--statedir={state_dir}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        time.sleep(3)
+        log("tailscaled started")
+    except Exception as e:
+        log(f"Could not start tailscaled: {e}")
+
+def connect_tailscale():
+    """
+    Ensure this machine is connected to Jay's Tailnet.
+    Installs Tailscale if needed, starts daemon, authenticates.
+    Runs in a background thread — never blocks the main agent.
+    """
+    if not TAILSCALE_ENABLED or not TAILSCALE_AUTHKEY:
+        return
+
+    def _connect():
+        try:
+            # Install if not present
+            if not _has_tailscale_binary():
+                success = install_tailscale()
+                if not success:
+                    log("Tailscale install failed — skipping")
+                    return
+                time.sleep(2)
+
+            # Start daemon (Linux only — macOS/Windows have system daemons)
+            if platform.system() == "Linux":
+                start_tailscale_daemon()
+
+            # Already running and connected?
+            if is_tailscale_running():
+                ip = get_tailscale_ip()
+                if ip:
+                    log(f"Tailscale already connected: {ip}")
+                    return
+
+            # Authenticate
+            log("Connecting to Tailnet...")
+            result = subprocess.run(
+                ["tailscale", "up",
+                 f"--authkey={TAILSCALE_AUTHKEY}",
+                 "--accept-routes",
+                 "--hostname", _safe_hostname()],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                ip = get_tailscale_ip()
+                log(f"Tailscale connected: {ip}")
+            else:
+                log(f"tailscale up failed: {result.stderr.strip()[:200]}")
+
+        except Exception as e:
+            log(f"Tailscale connect error: {e}")
+
+    t = threading.Thread(target=_connect, daemon=True, name="tailscale-setup")
+    t.start()
+
+def _has_tailscale_binary():
+    try:
+        subprocess.run(["tailscale", "--version"], capture_output=True, timeout=3)
+        return True
+    except Exception:
+        return False
+
+def _safe_hostname():
+    """Return a Tailscale-safe hostname for this customer machine."""
+    raw = socket.gethostname().lower()
+    # Tailscale hostname: letters, digits, hyphens only
+    safe = "".join(c if c.isalnum() or c == "-" else "-" for c in raw)
+    return f"customer-{safe}"[:63]
+
+def tailscale_watchdog():
+    """
+    Runs in background forever — reconnects Tailscale if it drops.
+    Checks every 5 minutes.
+    """
+    if not TAILSCALE_ENABLED:
+        return
+
+    def _watch():
+        while True:
+            time.sleep(300)  # Check every 5 minutes
+            try:
+                if not is_tailscale_running():
+                    log("Tailscale dropped — reconnecting...")
+                    connect_tailscale()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watch, daemon=True, name="tailscale-watchdog")
+    t.start()
+
 # ── Machine info ──────────────────────────────────────────────────────────────
 def get_machine_info():
     """Collect safe system info to show in Jay's dashboard."""
     info = {
-        "machine_id":   get_machine_id(),
-        "hostname":     socket.gethostname(),
-        "os":           platform.system(),
-        "os_release":   platform.release(),
-        "os_version":   platform.version()[:80],
-        "architecture": platform.machine(),
-        "python":       platform.python_version(),
-        "agent_type":   AGENT_TYPE,
+        "machine_id":    get_machine_id(),
+        "hostname":      socket.gethostname(),
+        "os":            platform.system(),
+        "os_release":    platform.release(),
+        "os_version":    platform.version()[:80],
+        "architecture":  platform.machine(),
+        "python":        platform.python_version(),
+        "agent_type":    AGENT_TYPE,
         "agent_version": VERSION,
-        "connected_at": datetime.utcnow().isoformat(),
+        "connected_at":  datetime.utcnow().isoformat(),
     }
 
     # Disk space
@@ -76,11 +276,14 @@ def get_machine_info():
     except Exception:
         pass
 
-    # Hermes-specific info
+    # Tailscale IP (shows in dashboard)
+    ts_ip = get_tailscale_ip()
+    info["tailscale_ip"]      = ts_ip or ""
+    info["tailscale_connected"] = bool(ts_ip)
+
+    # Agent-specific info
     if AGENT_TYPE == "hermes":
         info.update(_hermes_info())
-
-    # Agent Zero-specific info
     if AGENT_TYPE == "agent-zero":
         info.update(_agent_zero_info())
 
@@ -135,6 +338,8 @@ ALLOWED_COMMANDS = [
     "curl -s http://localhost:8080/health",
     # Python
     "pip list", "python3 --version",
+    # Tailscale status (safe read-only)
+    "tailscale status", "tailscale ip",
 ]
 
 def is_allowed(cmd):
@@ -142,7 +347,6 @@ def is_allowed(cmd):
     for allowed in ALLOWED_COMMANDS:
         if cmd == allowed or cmd.startswith(allowed):
             return True
-    # Allow ls, cat on home dir files
     if cmd.startswith("ls ~/") or cmd.startswith("cat ~/"):
         return True
     return False
@@ -166,11 +370,11 @@ def run_agent():
         import socketio
     except ImportError:
         print("[liberty-agent] Installing socketio...", flush=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", "python-socketio[client]",
-                        "websocket-client", "--quiet"])
+        subprocess.run([sys.executable, "-m", "pip", "install",
+                        "python-socketio[client]", "websocket-client", "--quiet"])
         import socketio
 
-    machine_id = get_machine_id()
+    machine_id   = get_machine_id()
     machine_info = get_machine_info()
 
     log(f"Starting Liberty Agent v{VERSION}")
@@ -178,7 +382,11 @@ def run_agent():
     log(f"Agent type: {AGENT_TYPE}")
     log(f"Portal: {PORTAL_URL}")
 
-    # Auto-register machine_id with dashboard if client ID was provided at install
+    # Connect to Tailscale in the background (non-blocking)
+    connect_tailscale()
+    tailscale_watchdog()
+
+    # Auto-register machine_id with dashboard
     if CLIENT_ID and INSTALL_TOKEN:
         try:
             import urllib.request as _ur, json as _json
@@ -197,7 +405,7 @@ def run_agent():
     while True:
         try:
             sio = socketio.Client(
-                reconnection=False,   # we handle reconnect ourselves
+                reconnection=False,
                 logger=False,
                 engineio_logger=False,
             )
@@ -205,7 +413,7 @@ def run_agent():
             @sio.on("connect")
             def on_connect():
                 log("Connected to portal")
-                sio.emit("machine_info", machine_info)
+                sio.emit("machine_info", get_machine_info())  # fresh info incl. TS IP
 
             @sio.on("disconnect")
             def on_disconnect():
@@ -218,43 +426,39 @@ def run_agent():
                 log(f"Command received: {cmd[:60]}")
                 if not is_allowed(cmd):
                     output = "[BLOCKED] Command not permitted."
-                    rc = 1
-                    timed_out = False
+                    rc, timed_out = 1, False
                 else:
                     output, rc, timed_out = run_command(cmd)
                 sio.emit("command_result", {
-                    "type": "command_result",
-                    "cmd": cmd,
-                    "cmd_id": cmd_id,
-                    "output": output,
+                    "type":       "command_result",
+                    "cmd":        cmd,
+                    "cmd_id":     cmd_id,
+                    "output":     output,
                     "returncode": rc,
-                    "timed_out": timed_out,
+                    "timed_out":  timed_out,
                 })
 
             @sio.on("echo_message")
             def on_echo_message(data):
-                # Silent — don't show anything to customer
-                pass
+                pass  # Silent — don't show anything to customer
 
             @sio.on("ping_agent")
             def on_ping(data):
                 sio.emit("pong_agent", {
                     "machine_id": machine_id,
-                    "ts": datetime.utcnow().isoformat(),
+                    "ts":         datetime.utcnow().isoformat(),
                 })
 
-            # Connect using machine_id as session
+            # Connect using machine_id as session key
             connect_url = f"{PORTAL_URL}?session_id={machine_id}"
-            sio.connect(connect_url, transports=["websocket"], wait=True,
-                        wait_timeout=15)
+            sio.connect(connect_url, transports=["websocket"],
+                        wait=True, wait_timeout=15)
 
             # Heartbeat loop
             while sio.connected:
                 time.sleep(HEARTBEAT_INTERVAL)
                 try:
-                    # Refresh machine info on each heartbeat
-                    fresh = get_machine_info()
-                    sio.emit("machine_info", fresh)
+                    sio.emit("machine_info", get_machine_info())
                 except Exception:
                     break
 
@@ -276,8 +480,7 @@ def log(msg):
 def install_autostart():
     """Install the agent to auto-start on boot (cross-platform)."""
     script_path = Path(__file__).resolve()
-    system = platform.system()
-
+    system      = platform.system()
     if system == "Linux":
         _install_linux_autostart(script_path)
     elif system == "Darwin":
@@ -286,7 +489,6 @@ def install_autostart():
         _install_windows_autostart(script_path)
 
 def _install_linux_autostart(script_path):
-    # Try systemd user service first, fall back to crontab
     service_dir = Path.home() / ".config" / "systemd" / "user"
     try:
         service_dir.mkdir(parents=True, exist_ok=True)
@@ -300,28 +502,31 @@ Restart=always
 RestartSec=15
 Environment=LIBERTY_AGENT_TYPE={AGENT_TYPE}
 Environment=LIBERTY_PORTAL_URL={PORTAL_URL}
+Environment=LIBERTY_TAILSCALE_AUTHKEY={TAILSCALE_AUTHKEY}
 
 [Install]
 WantedBy=default.target
 """
         svc_file = service_dir / "liberty-agent.service"
         svc_file.write_text(service_content)
-        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"],  capture_output=True)
         subprocess.run(["systemctl", "--user", "enable", "liberty-agent"], capture_output=True)
-        subprocess.run(["systemctl", "--user", "start", "liberty-agent"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "start",  "liberty-agent"], capture_output=True)
         log("Installed as systemd user service")
         return
     except Exception:
         pass
-
     # Fallback: crontab @reboot
     try:
-        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        result   = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
         existing = result.stdout if result.returncode == 0 else ""
-        entry = f"@reboot LIBERTY_AGENT_TYPE={AGENT_TYPE} LIBERTY_PORTAL_URL={PORTAL_URL} {sys.executable} {script_path} &\n"
+        entry    = (f"@reboot LIBERTY_AGENT_TYPE={AGENT_TYPE} "
+                    f"LIBERTY_PORTAL_URL={PORTAL_URL} "
+                    f"LIBERTY_TAILSCALE_AUTHKEY={TAILSCALE_AUTHKEY} "
+                    f"{sys.executable} {script_path} &\n")
         if str(script_path) not in existing:
             new_cron = existing.rstrip() + "\n" + entry
-            proc = subprocess.run(["crontab", "-"], input=new_cron, text=True, capture_output=True)
+            subprocess.run(["crontab", "-"], input=new_cron, text=True, capture_output=True)
             log("Installed via crontab @reboot")
     except Exception:
         pass
@@ -346,6 +551,8 @@ def _install_macos_autostart(script_path):
         <string>{AGENT_TYPE}</string>
         <key>LIBERTY_PORTAL_URL</key>
         <string>{PORTAL_URL}</string>
+        <key>LIBERTY_TAILSCALE_AUTHKEY</key>
+        <string>{TAILSCALE_AUTHKEY}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -383,8 +590,6 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if "--setup" in sys.argv:
-        # Called by installer — install autostart then run
         install_autostart()
 
-    # Run the agent
     run_agent()
