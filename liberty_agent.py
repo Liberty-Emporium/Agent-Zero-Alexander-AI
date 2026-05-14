@@ -22,7 +22,7 @@ from pathlib import Path
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PORTAL_URL    = os.getenv("LIBERTY_PORTAL_URL", "https://agent.install.alexanderai.site")
+PORTAL_URL    = os.getenv("LIBERTY_PORTAL_URL", "https://agents.alexanderai.site")
 AGENT_TYPE    = os.getenv("LIBERTY_AGENT_TYPE", "agent-zero")   # hermes | agent-zero
 CLIENT_ID     = os.getenv("LIBERTY_CLIENT_ID", "")          # Set at install time
 INSTALL_TOKEN = os.getenv("LIBERTY_INSTALL_TOKEN", "")      # Set at install time
@@ -741,3 +741,4 @@ if __name__ == "__main__":
         install_autostart()
 
     run_agent()
+
