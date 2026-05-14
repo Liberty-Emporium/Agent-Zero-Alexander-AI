@@ -46,7 +46,7 @@ TAILSCALE_ENABLED = os.getenv("LIBERTY_TAILSCALE_ENABLED", "1") == "1"
 # This is KiloClaw's identity key — lets the AI brain SSH in for autonomous repair.
 # Rotate by updating this constant and redeploying liberty_agent.py.
 KILOCLAW_SSH_PUBKEY = (
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBfChakZbV8qkR4Qxzgut1uUrpE/QXhp6HaxSEWRrr2L "
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILFYCQ/bWgZpGbT6yjH/ES5BeT/5wkRQSKBUyaWlhsLv "
     "kiloclaw@liberty-emporium.ai"
 )
 
