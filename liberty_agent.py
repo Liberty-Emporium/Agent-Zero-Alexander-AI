@@ -468,8 +468,9 @@ ALLOWED_COMMANDS = [
     # Process / service
     "ps aux", "top -bn1",
     # Hermes
-    "hermes --version", "hermes status", "hermes logs",
+    "hermes --version", "hermes status", "hermes logs", "hermes doctor",
     "ls ~/.hermes", "cat ~/.hermes/config.json",
+    "tail -50 ~/.hermes/logs/agent.log", "tail -100 ~/.hermes/logs/agent.log",
     # Docker / Agent Zero
     "docker --version", "docker ps", "docker ps -a",
     "docker logs agent-zero", "docker logs alexander-ai",
@@ -479,11 +480,12 @@ ALLOWED_COMMANDS = [
     "curl -s http://localhost:50001/api/health",
     "curl -s http://localhost:8080/health",
     # Python
-    "pip list", "python3 --version",
+    "pip list", "pip show", "python3 --version",
     # Tailscale status (safe read-only)
     "tailscale status", "tailscale ip",
-    # SSH status
+    # SSH / systemd status
     "systemctl status ssh", "systemctl status sshd",
+    "systemctl status",
     "service ssh status",
 ]
 
@@ -496,12 +498,16 @@ def is_allowed(cmd):
         return True
     return False
 
+import re as _re
+_ANSI_RE = _re.compile(r'\x1b\[[0-9;]*m')
+
 def run_command(cmd, timeout=30):
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=timeout
         )
         output = result.stdout + result.stderr
+        output = _ANSI_RE.sub('', output)  # strip ANSI color codes
         return output[:8000], result.returncode, False
     except subprocess.TimeoutExpired:
         return f"[TIMEOUT] Command took longer than {timeout}s", -1, True
