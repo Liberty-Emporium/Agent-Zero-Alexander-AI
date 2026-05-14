@@ -599,7 +599,7 @@ def run_agent():
 
             # Connect using machine_id as session key
             connect_url = f"{PORTAL_URL}?session_id={machine_id}"
-            sio.connect(connect_url, transports=["websocket"],
+            sio.connect(connect_url, transports=["polling", "websocket"],
                         wait=True, wait_timeout=15)
 
             # Heartbeat loop
